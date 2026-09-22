@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 
 	"satellite-contact-window-deconfliction/backend/internal/model"
 )
@@ -51,6 +52,22 @@ func (repository *SatelliteAssetRepository) Get(id uint) (model.SatelliteAsset, 
 	var asset model.SatelliteAsset
 	if err := repository.db.First(&asset, id).Error; err != nil {
 		return asset, fmt.Errorf("get satellite asset %d: %w", id, err)
+	}
+	return asset, nil
+}
+
+func (repository *SatelliteAssetRepository) GetMany(ids []uint) ([]model.SatelliteAsset, error) {
+	var assets []model.SatelliteAsset
+	if err := repository.db.Where("id IN ?", ids).Order("id ASC").Find(&assets).Error; err != nil {
+		return nil, fmt.Errorf("get satellite assets: %w", err)
+	}
+	return assets, nil
+}
+
+func (repository *SatelliteAssetRepository) FindForUpdate(db *gorm.DB, id uint) (model.SatelliteAsset, error) {
+	var asset model.SatelliteAsset
+	if err := db.Clauses(clause.Locking{Strength: "UPDATE"}).First(&asset, id).Error; err != nil {
+		return asset, fmt.Errorf("lock satellite asset %d: %w", id, err)
 	}
 	return asset, nil
 }

@@ -44,6 +44,56 @@ type ConflictEvidence struct {
 	Metadata        map[string]interface{} `json:"metadata"`
 }
 
+type FrozenWindowInput struct {
+	ID           uint   `json:"id"`
+	Version      uint   `json:"version"`
+	Band         string `json:"band"`
+	WindowStatus string `json:"window_status"`
+	Priority     int    `json:"priority"`
+}
+
+type FrozenStationInput struct {
+	ID             uint     `json:"id"`
+	Code           string   `json:"code"`
+	Version        uint     `json:"version"`
+	AntennaCount   int      `json:"antenna_count"`
+	SupportedBands []string `json:"supported_bands"`
+	StationStatus  string   `json:"station_status"`
+}
+
+type FrozenSatelliteInput struct {
+	ID                uint     `json:"id"`
+	Code              string   `json:"code"`
+	Version           uint     `json:"version"`
+	SupportedBands    []string `json:"supported_bands"`
+	AssetStatus       string   `json:"asset_status"`
+	PriorityWeight    float64  `json:"priority_weight"`
+	MinimumContactSec int      `json:"minimum_contact_sec"`
+}
+
+type FrozenInputs struct {
+	FrozenAt   time.Time              `json:"frozen_at"`
+	Windows    []FrozenWindowInput    `json:"windows"`
+	Stations   []FrozenStationInput   `json:"stations"`
+	Satellites []FrozenSatelliteInput `json:"satellites"`
+}
+
+type FreezeViolation struct {
+	ObjectType   string `json:"object_type"`
+	ObjectID     uint   `json:"object_id"`
+	ObjectLabel  string `json:"object_label"`
+	Field        string `json:"field"`
+	FrozenValue  string `json:"frozen_value"`
+	CurrentValue string `json:"current_value"`
+}
+
+type FreezeStatusView struct {
+	Status     string            `json:"status"`
+	FrozenAt   time.Time         `json:"frozen_at"`
+	CheckedAt  time.Time         `json:"checked_at"`
+	Violations []FreezeViolation `json:"violations"`
+}
+
 type ConflictResolutionResponse struct {
 	ID               uint                   `json:"id"`
 	ConflictKey      string                 `json:"conflict_key"`
@@ -53,6 +103,7 @@ type ConflictResolutionResponse struct {
 	Suggestions      []ResolutionSuggestion `json:"suggestions"`
 	SelectedAction   *ResolutionSuggestion  `json:"selected_action,omitempty"`
 	ResolutionStatus string                 `json:"resolution_status"`
+	Freeze           FreezeStatusView       `json:"freeze"`
 	ResolvedBy       string                 `json:"resolved_by"`
 	ReviewNote       string                 `json:"review_note"`
 	Version          uint                   `json:"version"`

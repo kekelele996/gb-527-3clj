@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 
 	"satellite-contact-window-deconfliction/backend/internal/model"
 )
@@ -51,6 +52,22 @@ func (repository *GroundStationRepository) Get(id uint) (model.GroundStation, er
 	var station model.GroundStation
 	if err := repository.db.First(&station, id).Error; err != nil {
 		return station, fmt.Errorf("get ground station %d: %w", id, err)
+	}
+	return station, nil
+}
+
+func (repository *GroundStationRepository) GetMany(ids []uint) ([]model.GroundStation, error) {
+	var stations []model.GroundStation
+	if err := repository.db.Where("id IN ?", ids).Order("id ASC").Find(&stations).Error; err != nil {
+		return nil, fmt.Errorf("get ground stations: %w", err)
+	}
+	return stations, nil
+}
+
+func (repository *GroundStationRepository) FindForUpdate(db *gorm.DB, id uint) (model.GroundStation, error) {
+	var station model.GroundStation
+	if err := db.Clauses(clause.Locking{Strength: "UPDATE"}).First(&station, id).Error; err != nil {
+		return station, fmt.Errorf("lock ground station %d: %w", id, err)
 	}
 	return station, nil
 }

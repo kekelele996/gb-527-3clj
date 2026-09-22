@@ -7,6 +7,7 @@ type ConflictResolution struct {
 	ConflictKey        string `gorm:"size:80;uniqueIndex;not null"`
 	WindowIDsJSON      string `gorm:"type:text;not null"`
 	WindowVersionsJSON string `gorm:"type:text;not null"`
+	FrozenInputsJSON   string `gorm:"type:text;not null;default:'{}'"`
 	ConflictType       string `gorm:"size:32;index;not null"`
 	EvidenceJSON       string `gorm:"type:text;not null"`
 	SuggestionsJSON    string `gorm:"type:text;not null"`

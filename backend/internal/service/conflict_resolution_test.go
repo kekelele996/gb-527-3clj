@@ -73,8 +73,22 @@ func TestReviewDetectsChangedWindowAndRejectRemainsAvailable(t *testing.T) {
 	reviewer := dto.Actor{ID: 2, Username: "reviewer", Role: constants.RoleReviewer}
 	_, err = service.Review(target.ID, dto.ConflictActionRequest{ExpectedVersion: target.Version, Decision: constants.ResolutionStatusAccepted, ActionKey: target.Suggestions[0].ActionKey}, reviewer, "test-accept")
 	var appError *AppError
-	if !errors.As(err, &appError) || appError.Code != "version_conflict" {
-		t.Fatalf("expected version_conflict, got %v", err)
+	if !errors.As(err, &appError) || appError.Code != "frozen_inputs_changed" {
+		t.Fatalf("expected frozen_inputs_changed, got %v", err)
+	}
+	blocked, err := service.Get(target.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if blocked.ResolutionStatus != constants.ResolutionStatusPendingReview || blocked.ResolvedBy != "" || blocked.ReviewNote != "" {
+		t.Fatalf("blocked accept must leave the review untouched, got %+v", blocked)
+	}
+	if blocked.Freeze.Status != constants.FreezeStatusViolated || len(blocked.Freeze.Violations) == 0 {
+		t.Fatalf("expected violated freeze with changed objects, got %+v", blocked.Freeze)
+	}
+	violation := blocked.Freeze.Violations[0]
+	if violation.ObjectType != constants.FreezeObjectWindow || violation.Field != "priority" || violation.FrozenValue != "8" || violation.CurrentValue != "9" {
+		t.Fatalf("unexpected violation %+v", violation)
 	}
 	rejected, err := service.Review(target.ID, dto.ConflictActionRequest{ExpectedVersion: target.Version, Decision: constants.ResolutionStatusRejected, ReviewNote: "Orbit source changed during review"}, reviewer, "test-reject")
 	if err != nil {

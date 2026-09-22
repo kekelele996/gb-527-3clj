@@ -3,8 +3,6 @@ package service
 import (
 	"encoding/json"
 	"errors"
-	"fmt"
-	"sort"
 	"strconv"
 	"time"
 
@@ -47,6 +45,9 @@ func (service *ConflictResolutionService) List(page, pageSize int, status, confl
 		}
 		responses = append(responses, response)
 	}
+	if err := service.attachFreezeViews(resolutions, responses); err != nil {
+		return nil, dto.PageMeta{}, err
+	}
 	return responses, pageMeta(page, pageSize, total), nil
 }
 
@@ -55,7 +56,15 @@ func (service *ConflictResolutionService) Get(id uint) (dto.ConflictResolutionRe
 	if err != nil {
 		return dto.ConflictResolutionResponse{}, MapRepositoryError("conflict resolution", err)
 	}
-	return resolutionResponse(resolution)
+	response, err := resolutionResponse(resolution)
+	if err != nil {
+		return dto.ConflictResolutionResponse{}, err
+	}
+	responses := []dto.ConflictResolutionResponse{response}
+	if err := service.attachFreezeViews([]model.ConflictResolution{resolution}, responses); err != nil {
+		return dto.ConflictResolutionResponse{}, err
+	}
+	return responses[0], nil
 }
 
 func (service *ConflictResolutionService) Detect(request dto.DetectConflictsRequest, actor dto.Actor, requestID string) (dto.DetectionResult, error) {
@@ -92,13 +101,25 @@ func (service *ConflictResolutionService) Detect(request dto.DetectConflictsRequ
 	}
 	groups := scheduler.Detect(scheduler.DetectionContext{Windows: windows, Stations: stationMap, Satellites: assetMap})
 	generator := scheduler.NewCandidateGenerator(service.weights, stations, assets, windows)
-	responses := make([]dto.ConflictResolutionResponse, 0, len(groups))
+	frozenAt := time.Now().UTC()
+	detected := make([]model.ConflictResolution, 0, len(groups))
 	for _, group := range groups {
-		resolution, err := service.persistDetection(group, generator.Generate(group), actor, requestID)
+		resolution, err := service.persistDetection(group, generator.Generate(group), buildFrozenInputs(group.Windows, stationMap, assetMap, frozenAt), actor, requestID)
 		if err != nil {
 			return dto.DetectionResult{}, err
 		}
-		responses = append(responses, resolution)
+		detected = append(detected, resolution)
+	}
+	responses := make([]dto.ConflictResolutionResponse, 0, len(detected))
+	for _, resolution := range detected {
+		response, parseErr := resolutionResponse(resolution)
+		if parseErr != nil {
+			return dto.DetectionResult{}, parseErr
+		}
+		responses = append(responses, response)
+	}
+	if err := service.attachFreezeViews(detected, responses); err != nil {
+		return dto.DetectionResult{}, err
 	}
 	if err := service.audit.Record(actor, requestID, "conflicts.scanned", "planning_range", from.UTC().Format(time.RFC3339), map[string]any{"from": from.UTC(), "to": to.UTC(), "window_count": len(windows), "weights": service.weights}, nil, map[string]any{"conflict_count": len(groups)}); err != nil {
 		return dto.DetectionResult{}, err
@@ -106,9 +127,9 @@ func (service *ConflictResolutionService) Detect(request dto.DetectConflictsRequ
 	return dto.DetectionResult{RangeFrom: from.UTC(), RangeTo: to.UTC(), WindowCount: len(windows), ConflictCount: len(groups), Resolutions: responses}, nil
 }
 
-func (service *ConflictResolutionService) persistDetection(group scheduler.ConflictGroup, suggestions []scheduler.Suggestion, actor dto.Actor, requestID string) (dto.ConflictResolutionResponse, error) {
+func (service *ConflictResolutionService) persistDetection(group scheduler.ConflictGroup, suggestions []scheduler.Suggestion, frozen dto.FrozenInputs, actor dto.Actor, requestID string) (model.ConflictResolution, error) {
 	if existing, err := service.repository.FindByKey(group.Key); err == nil {
-		return resolutionResponse(existing)
+		return existing, nil
 	}
 	windowIDs := make([]uint, 0, len(group.Windows))
 	versions := map[string]uint{}
@@ -120,7 +141,7 @@ func (service *ConflictResolutionService) persistDetection(group scheduler.Confl
 	}
 	evidence := dto.ConflictEvidence{Summary: group.Summary, WindowFacts: facts, Capacity: group.Capacity, PeakConcurrency: group.PeakConcurrency, BufferSeconds: group.BufferSeconds, Metadata: group.Metadata}
 	resolution := model.ConflictResolution{
-		ConflictKey: group.Key, WindowIDsJSON: mustJSON(windowIDs), WindowVersionsJSON: mustJSON(versions), ConflictType: group.ConflictType,
+		ConflictKey: group.Key, WindowIDsJSON: mustJSON(windowIDs), WindowVersionsJSON: mustJSON(versions), FrozenInputsJSON: mustJSON(frozen), ConflictType: group.ConflictType,
 		EvidenceJSON: mustJSON(evidence), SuggestionsJSON: mustJSON(suggestions), WeightsJSON: mustJSON(service.weights), SelectedAction: "{}",
 		ResolutionStatus: constants.ResolutionStatusDetected, Version: 1,
 	}
@@ -143,15 +164,15 @@ func (service *ConflictResolutionService) persistDetection(group scheduler.Confl
 	})
 	if err != nil {
 		if existing, findErr := service.repository.FindByKey(group.Key); findErr == nil {
-			return resolutionResponse(existing)
+			return existing, nil
 		}
-		return dto.ConflictResolutionResponse{}, Internal("could not persist conflict detection", err)
+		return model.ConflictResolution{}, Internal("could not persist conflict detection", err)
 	}
 	created, err := service.repository.Get(resolution.ID)
 	if err != nil {
-		return dto.ConflictResolutionResponse{}, Internal("could not reload conflict resolution", err)
+		return model.ConflictResolution{}, Internal("could not reload conflict resolution", err)
 	}
-	return resolutionResponse(created)
+	return created, nil
 }
 
 func (service *ConflictResolutionService) Submit(id uint, request dto.ConflictActionRequest, actor dto.Actor, requestID string) (dto.ConflictResolutionResponse, error) {
@@ -173,7 +194,7 @@ func (service *ConflictResolutionService) Submit(id uint, request dto.ConflictAc
 	if err := service.audit.Record(actor, requestID, "conflict.submitted", "conflict_resolution", auditID(id), map[string]any{"expected_version": request.ExpectedVersion}, resolutionSummary(before), resolutionSummary(after)); err != nil {
 		return dto.ConflictResolutionResponse{}, err
 	}
-	return resolutionResponse(after)
+	return service.Get(id)
 }
 
 func (service *ConflictResolutionService) Review(id uint, request dto.ConflictActionRequest, actor dto.Actor, requestID string) (dto.ConflictResolutionResponse, error) {
@@ -183,6 +204,7 @@ func (service *ConflictResolutionService) Review(id uint, request dto.ConflictAc
 	if request.Decision == constants.ResolutionStatusAccepted && request.ActionKey == "" {
 		return dto.ConflictResolutionResponse{}, BadRequest("action_required", "an accepted resolution must select an action")
 	}
+	var violations []dto.FreezeViolation
 	err := service.repository.DB().Transaction(func(tx *gorm.DB) error {
 		resolution, err := service.repository.GetForUpdate(tx, id)
 		if err != nil {
@@ -200,8 +222,13 @@ func (service *ConflictResolutionService) Review(id uint, request dto.ConflictAc
 			if err != nil {
 				return err
 			}
-			if err := service.verifyWindowVersions(tx, resolution.WindowVersionsJSON); err != nil {
+			changed, err := service.checkFrozenInputs(tx, resolution)
+			if err != nil {
 				return err
+			}
+			if len(changed) > 0 {
+				violations = changed
+				return errFrozenInputsChanged
 			}
 			values["selected_action"] = mustJSON(selected)
 		}
@@ -215,6 +242,17 @@ func (service *ConflictResolutionService) Review(id uint, request dto.ConflictAc
 		parameters := map[string]any{"decision": request.Decision, "action_key": request.ActionKey, "review_note_length": len(request.ReviewNote), "expected_version": request.ExpectedVersion}
 		return service.audit.RecordTx(tx, actor, requestID, "conflict.reviewed", "conflict_resolution", auditID(id), parameters, resolutionSummary(resolution), map[string]any{"status": request.Decision, "selected_action_key": request.ActionKey, "resolved_by": actor.Username, "version": request.ExpectedVersion + 1})
 	})
+	if errors.Is(err, errFrozenInputsChanged) {
+		// The accept is rejected as a whole: the resolution stays in
+		// pending_review and its stored snapshot, audit history and any
+		// existing review note are left untouched. The block itself is
+		// appended to the audit trail with the changed objects.
+		parameters := map[string]any{"decision": request.Decision, "action_key": request.ActionKey, "violation_count": len(violations)}
+		if recordErr := service.audit.Record(actor, requestID, "conflict.review_blocked", "conflict_resolution", auditID(id), parameters, nil, map[string]any{"violations": violations}); recordErr != nil {
+			return dto.ConflictResolutionResponse{}, recordErr
+		}
+		return dto.ConflictResolutionResponse{}, Conflict("frozen_inputs_changed", freezeBlockMessage(violations), nil).WithDetails(map[string]any{"violations": violations})
+	}
 	if err != nil {
 		return dto.ConflictResolutionResponse{}, err
 	}
@@ -234,32 +272,6 @@ func (service *ConflictResolutionService) Export(id uint) (map[string]any, error
 		"window_ids": resolution.WindowIDs, "selected_action": resolution.SelectedAction, "resolved_by": resolution.ResolvedBy,
 		"resolved_at": resolution.ResolvedAt, "disclaimer": "Planning record only; no antenna or spacecraft control command is emitted.",
 	}, nil
-}
-
-func (service *ConflictResolutionService) verifyWindowVersions(tx *gorm.DB, encoded string) error {
-	versions := map[string]uint{}
-	if err := json.Unmarshal([]byte(encoded), &versions); err != nil {
-		return Internal("stored window version snapshot is invalid", err)
-	}
-	keys := make([]string, 0, len(versions))
-	for id := range versions {
-		keys = append(keys, id)
-	}
-	sort.Strings(keys)
-	for _, encodedID := range keys {
-		parsed, err := strconv.ParseUint(encodedID, 10, 64)
-		if err != nil {
-			return Internal("stored window ID is invalid", err)
-		}
-		window, err := service.windows.FindForUpdate(tx, uint(parsed))
-		if err != nil {
-			return MapRepositoryError("contact window", err)
-		}
-		if window.Version != versions[encodedID] {
-			return Conflict("version_conflict", fmt.Sprintf("window %d changed after conflict detection", window.ID), nil)
-		}
-	}
-	return nil
 }
 
 func resolutionResponse(resolution model.ConflictResolution) (dto.ConflictResolutionResponse, error) {
@@ -304,5 +316,3 @@ func mustJSON(value any) string { encoded, _ := json.Marshal(value); return stri
 func resolutionSummary(resolution model.ConflictResolution) map[string]any {
 	return map[string]any{"conflict_type": resolution.ConflictType, "status": resolution.ResolutionStatus, "version": resolution.Version, "resolved_by": resolution.ResolvedBy}
 }
-
-var _ = errors.Is

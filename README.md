@@ -37,10 +37,19 @@ docker compose down -v --remove-orphans
 - `/stations`：地面站容量、天线数、频段、转向缓冲和窗口占用。
 - `/satellites`：规划资产、优先权、最短接触需求和按卫星分组的时间线。
 - `/windows`：UTC 候选窗口筛选、创建、兼容性提交和不可移动锁定。
-- `/conflicts`：冲突扫描、证据、稳定排序建议、提交复核和人工接受/拒绝。
+- `/conflicts`：冲突扫描、证据、稳定排序建议、提交复核和人工接受/拒绝；扫描时冻结规划输入，复核前展示冻结状态与变化对象。
 - `/audit`：request ID、参数摘要、版本前后差异、算法权重和人工选择。
 
-接受建议只会在一个数据库事务内核对所有关联窗口版本并保存 reviewer 的选择，不会自动移动窗口。只有 accepted 记录可以通过导出 API 形成离线规划记录。
+接受建议只会在一个数据库事务内核对所有冻结输入并保存 reviewer 的选择，不会自动移动窗口。只有 accepted 记录可以通过导出 API 形成离线规划记录。
+
+## 规划输入冻结
+
+冲突扫描（`POST /api/v1/conflicts/detect`）会把每个冲突组涉及的窗口、地面站和卫星的规划输入快照写入 `conflict_resolutions.frozen_inputs_json`：窗口的版本、频段、状态和优先权；地面站的容量（天线数）、支持频段和状态；卫星的支持频段、状态、优先权和最短接触要求。快照写入后不再改写。
+
+- 送审后任一容量、频段、状态、优先权或最短接触要求发生变化时，接受请求整次拒绝：返回 `409 frozen_inputs_changed`，冲突保持 `pending_review`，`resolved_by`、`review_note` 和既有审计事件均不改写，仅追加一条 `conflict.review_blocked` 审计。拒绝（reject）不受冻结影响，仍可正常保存。
+- 只有全部冻结输入仍然有效、且乐观锁保证并发复核仅一次成功时，人工选择才会被记录为 `accepted` 并允许导出。
+- `GET /api/v1/conflicts[/:id]` 实时比对冻结快照与当前数据，在 `freeze` 字段返回 `status`（`intact | violated`）、`frozen_at`、`checked_at` 和 `violations`（对象类型、标识、字段、变化前后值）；页面刷新后冲突页据此展示冻结状态、阻塞原因和前后值，冻结被违反时接受按钮禁用。
+- 后端实现：`service/planning_freeze.go`（快照、比对、事务内校验）；早期没有快照的记录回退到窗口版本检查。前端：`types/conflict.ts` 的 `FreezeState` 与 `pages/conflicts.page.ts` 的冻结面板。
 
 ## 技术栈与目录
 
@@ -168,7 +177,8 @@ npm --prefix frontend run build
 
 - backend 不 healthy：查看 `docker compose logs backend`，检查 JWT 至少 32 字节、DSN 和 PostgreSQL 健康状态。
 - 前端 `/api` 返回 502：确认 backend healthy；Nginx 保留 `/api/v1` 原路径，不应给 `proxy_pass` 添加尾斜杠。
-- 接受方案返回 `version_conflict`：冲突检测后有窗口版本变化，重新检测并再次提交复核。
+- 接受方案返回 `frozen_inputs_changed`：送审后冻结的容量、频段、状态、优先权或最短接触要求已变化；冲突保持待复核，恢复输入或重新扫描后再审。
+- 提交或复核返回 `version_conflict`：冲突记录本身的版本已变化，重新加载后再操作。
 - 提交窗口返回 `band_incompatible` 或 `duration_shortfall`：修正候选窗口；候选仍可保留用于冲突证据分析。
 
 ## License

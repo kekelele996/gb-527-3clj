@@ -33,6 +33,24 @@ export interface ConflictEvidence {
   metadata: Record<string, unknown>;
 }
 
+export type FreezeStatus = 'intact' | 'violated';
+
+export interface FreezeViolation {
+  object_type: 'window' | 'station' | 'satellite';
+  object_id: number;
+  object_label: string;
+  field: string;
+  frozen_value: string;
+  current_value: string;
+}
+
+export interface FreezeState {
+  status: FreezeStatus;
+  frozen_at: string;
+  checked_at: string;
+  violations: FreezeViolation[];
+}
+
 export interface ConflictResolution {
   id: number;
   conflict_key: string;
@@ -42,6 +60,7 @@ export interface ConflictResolution {
   suggestions: ResolutionSuggestion[];
   selected_action?: ResolutionSuggestion;
   resolution_status: ResolutionStatus;
+  freeze: FreezeState;
   resolved_by: string;
   review_note: string;
   version: number;

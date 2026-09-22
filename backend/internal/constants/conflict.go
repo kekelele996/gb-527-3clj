@@ -24,6 +24,17 @@ const (
 	ResolutionStatusRejected      = "rejected"
 )
 
+const (
+	FreezeStatusIntact   = "intact"
+	FreezeStatusViolated = "violated"
+)
+
+const (
+	FreezeObjectWindow    = "window"
+	FreezeObjectStation   = "station"
+	FreezeObjectSatellite = "satellite"
+)
+
 func CanTransitionResolution(from, to string) bool {
 	switch from {
 	case ResolutionStatusDetected:
