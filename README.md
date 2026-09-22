@@ -37,10 +37,18 @@ docker compose down -v --remove-orphans
 - `/stations`：地面站容量、天线数、频段、转向缓冲和窗口占用。
 - `/satellites`：规划资产、优先权、最短接触需求和按卫星分组的时间线。
 - `/windows`：UTC 候选窗口筛选、创建、兼容性提交和不可移动锁定。
-- `/conflicts`：冲突扫描、证据、稳定排序建议、提交复核和人工接受/拒绝。
-- `/audit`：request ID、参数摘要、版本前后差异、算法权重和人工选择。
+- `/conflicts`：冲突扫描、证据、稳定排序建议、提交复核和人工接受/拒绝；扫描时冻结规划输入，复核前校验。
+- `/audit`：request ID、参数摘要、版本前后差异、算法权重、人工选择和冻结评估（`conflict.accept_blocked`）。
 
 接受建议只会在一个数据库事务内核对所有关联窗口版本并保存 reviewer 的选择，不会自动移动窗口。只有 accepted 记录可以通过导出 API 形成离线规划记录。
+
+## 规划输入冻结
+
+- 冲突扫描时为每组冲突冻结相关窗口、地面站和卫星的版本与关键输入：窗口状态/频段/优先权、站点容量（天线数）/支持频段/状态、卫星支持频段/优先权/最短接触要求/状态，快照持久化在 `conflict_resolutions.frozen_inputs_json`。
+- 送审后任一冻结的容量、频段、状态、优先权或最短接触要求发生变化时，接受必须整次失败（409 `frozen_input_changed`，窗口版本漂移仍为 `version_conflict`），冲突保持 `pending_review`，响应与 `frozen_changes_json` 列出已变化对象及变化前后值。
+- 被阻止的接受在同一事务内只写入冻结失效标记和 `conflict.accept_blocked` 审计事件，不改写既有审计、`review_note`、`resolved_by` 或已存建议；拒绝（rejected）不受冻结校验限制，仍可保存。
+- 只有全部冻结输入仍有效、且乐观版本锁保证并发复核仅一次成功时，人工选择才会落库并允许导出；导出记录附带 `freeze_status` 与 `frozen_inputs_validated`。
+- 冲突详情始终返回 `freeze_status`（`frozen | invalidated`）、`freeze_blocked_reason` 和 `frozen_changes`，页面刷新后仍展示冻结状态、阻塞原因和变化前后值。
 
 ## 技术栈与目录
 
@@ -130,6 +138,16 @@ docker compose down -v --remove-orphans
 - 前端共享组件：`ResolutionComparePanel`、`WindowStatusBadge`。
 - 前端页面：`conflicts.page.ts` 与 `audit.page.ts`。
 
+### FreezeStatus
+
+值为 `frozen | invalidated`，配合 `freeze_blocked_reason`（当前仅 `frozen_inputs_changed`）与 `frozen_changes` 的对象类型 `contact_window | ground_station | satellite_asset`。
+
+- 数据库：`conflict_resolutions.freeze_status`、`frozen_inputs_json`、`frozen_changes_json`、`freeze_blocked_reason`。
+- 后端常量：`backend/internal/constants/conflict.go`（`FreezeStatus*`、`FreezeBlockReasonInputsChanged`、`FrozenObject*`）。
+- 后端快照与评估：`service/conflict_resolution.go` 的 `freezeSnapshot`、`evaluateFrozenInputs`，模型字段在 `model/conflict_resolution.go`，DTO 在 `dto/conflict_resolution.go`。
+- 前端类型：`frontend/src/app/types/conflict.ts`（`FreezeStatus`、`FrozenInputsSnapshot`、`FrozenInputChange`）。
+- 前端展示：`conflicts.page.ts` 冻结面板与 `WindowStatusBadge` 的 `frozen`/`invalidated` 样式。
+
 ## 算法假设
 
 1. 区间采用半开区间 `[start_at, end_at)`，同一时刻结束和开始不算原始重叠。
@@ -169,6 +187,7 @@ npm --prefix frontend run build
 - backend 不 healthy：查看 `docker compose logs backend`，检查 JWT 至少 32 字节、DSN 和 PostgreSQL 健康状态。
 - 前端 `/api` 返回 502：确认 backend healthy；Nginx 保留 `/api/v1` 原路径，不应给 `proxy_pass` 添加尾斜杠。
 - 接受方案返回 `version_conflict`：冲突检测后有窗口版本变化，重新检测并再次提交复核。
+- 接受方案返回 `frozen_input_changed`：送审后冻结的容量、频段、状态、优先权或最短接触要求发生变化；响应 `error.details.changed_objects` 与冲突详情的 `frozen_changes` 列出变化前后值，恢复输入或重新扫描后再审，拒绝不受影响。
 - 提交窗口返回 `band_incompatible` 或 `duration_shortfall`：修正候选窗口；候选仍可保留用于冲突证据分析。
 
 ## License

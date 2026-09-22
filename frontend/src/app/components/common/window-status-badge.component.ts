@@ -11,8 +11,8 @@ import { CommonModule } from '@angular/common';
     .candidate, .detected { background: #edf0eb; }
     .submitted, .proposed { background: #e6eef5; color: #294f72; border-color: #b9cbd9; }
     .locked, .pending_review { background: #fff2c7; color: #73550a; border-color: #dec778; }
-    .allocated, .accepted { background: #e0efe7; color: #205d45; border-color: #afd0be; }
-    .cancelled, .rejected { background: #f6e2df; color: #8a352f; border-color: #dcaaa5; }
+    .allocated, .accepted, .frozen { background: #e0efe7; color: #205d45; border-color: #afd0be; }
+    .cancelled, .rejected, .invalidated { background: #f6e2df; color: #8a352f; border-color: #dcaaa5; }
   `],
   changeDetection: ChangeDetectionStrategy.OnPush,
 })

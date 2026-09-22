@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"gorm.io/gorm"
@@ -94,7 +95,7 @@ func (service *ConflictResolutionService) Detect(request dto.DetectConflictsRequ
 	generator := scheduler.NewCandidateGenerator(service.weights, stations, assets, windows)
 	responses := make([]dto.ConflictResolutionResponse, 0, len(groups))
 	for _, group := range groups {
-		resolution, err := service.persistDetection(group, generator.Generate(group), actor, requestID)
+		resolution, err := service.persistDetection(group, generator.Generate(group), stationMap, assetMap, actor, requestID)
 		if err != nil {
 			return dto.DetectionResult{}, err
 		}
@@ -106,7 +107,7 @@ func (service *ConflictResolutionService) Detect(request dto.DetectConflictsRequ
 	return dto.DetectionResult{RangeFrom: from.UTC(), RangeTo: to.UTC(), WindowCount: len(windows), ConflictCount: len(groups), Resolutions: responses}, nil
 }
 
-func (service *ConflictResolutionService) persistDetection(group scheduler.ConflictGroup, suggestions []scheduler.Suggestion, actor dto.Actor, requestID string) (dto.ConflictResolutionResponse, error) {
+func (service *ConflictResolutionService) persistDetection(group scheduler.ConflictGroup, suggestions []scheduler.Suggestion, stations map[uint]model.GroundStation, assets map[uint]model.SatelliteAsset, actor dto.Actor, requestID string) (dto.ConflictResolutionResponse, error) {
 	if existing, err := service.repository.FindByKey(group.Key); err == nil {
 		return resolutionResponse(existing)
 	}
@@ -118,18 +119,20 @@ func (service *ConflictResolutionService) persistDetection(group scheduler.Confl
 		versions[strconv.FormatUint(uint64(window.ID), 10)] = window.Version
 		facts = append(facts, map[string]any{"id": window.ID, "station_id": window.StationID, "satellite_id": window.SatelliteID, "start_at": window.StartAt, "end_at": window.EndAt, "duration_sec": window.DurationSec(), "band": window.Band, "priority": window.Priority, "locked": window.Locked, "version": window.Version})
 	}
+	snapshot := freezeSnapshot(group.Windows, stations, assets)
 	evidence := dto.ConflictEvidence{Summary: group.Summary, WindowFacts: facts, Capacity: group.Capacity, PeakConcurrency: group.PeakConcurrency, BufferSeconds: group.BufferSeconds, Metadata: group.Metadata}
 	resolution := model.ConflictResolution{
 		ConflictKey: group.Key, WindowIDsJSON: mustJSON(windowIDs), WindowVersionsJSON: mustJSON(versions), ConflictType: group.ConflictType,
 		EvidenceJSON: mustJSON(evidence), SuggestionsJSON: mustJSON(suggestions), WeightsJSON: mustJSON(service.weights), SelectedAction: "{}",
-		ResolutionStatus: constants.ResolutionStatusDetected, Version: 1,
+		ResolutionStatus: constants.ResolutionStatusDetected, FrozenInputsJSON: mustJSON(snapshot), FreezeStatus: constants.FreezeStatusFrozen,
+		FrozenChangesJSON: "[]", Version: 1,
 	}
 	err := service.repository.DB().Transaction(func(tx *gorm.DB) error {
 		txRepository := service.repository.WithDB(tx)
 		if err := txRepository.Create(&resolution); err != nil {
 			return err
 		}
-		if err := service.audit.RecordTx(tx, actor, requestID, "conflict.detected", "conflict_resolution", auditID(resolution.ID), map[string]any{"conflict_type": group.ConflictType, "window_ids": windowIDs, "weights": service.weights}, nil, map[string]any{"status": constants.ResolutionStatusDetected, "version": 1}); err != nil {
+		if err := service.audit.RecordTx(tx, actor, requestID, "conflict.detected", "conflict_resolution", auditID(resolution.ID), map[string]any{"conflict_type": group.ConflictType, "window_ids": windowIDs, "weights": service.weights}, nil, map[string]any{"status": constants.ResolutionStatusDetected, "version": 1, "freeze_status": constants.FreezeStatusFrozen, "frozen_window_count": len(snapshot.Windows), "frozen_station_count": len(snapshot.Stations), "frozen_satellite_count": len(snapshot.Satellites)}); err != nil {
 			return err
 		}
 		updated, err := txRepository.Transition(tx, resolution.ID, 1, constants.ResolutionStatusDetected, constants.ResolutionStatusProposed, map[string]any{})
@@ -183,6 +186,7 @@ func (service *ConflictResolutionService) Review(id uint, request dto.ConflictAc
 	if request.Decision == constants.ResolutionStatusAccepted && request.ActionKey == "" {
 		return dto.ConflictResolutionResponse{}, BadRequest("action_required", "an accepted resolution must select an action")
 	}
+	var blocked *AppError
 	err := service.repository.DB().Transaction(func(tx *gorm.DB) error {
 		resolution, err := service.repository.GetForUpdate(tx, id)
 		if err != nil {
@@ -200,10 +204,26 @@ func (service *ConflictResolutionService) Review(id uint, request dto.ConflictAc
 			if err != nil {
 				return err
 			}
-			if err := service.verifyWindowVersions(tx, resolution.WindowVersionsJSON); err != nil {
+			changes, err := service.evaluateFrozenInputs(tx, resolution)
+			if err != nil {
 				return err
 			}
+			if len(changes) > 0 {
+				if err := service.repository.RecordFreezeEvaluation(tx, id, constants.FreezeStatusInvalidated, constants.FreezeBlockReasonInputsChanged, mustJSON(changes)); err != nil {
+					return Internal("could not record freeze evaluation", err)
+				}
+				parameters := map[string]any{"decision": request.Decision, "action_key": request.ActionKey, "review_note_length": len(request.ReviewNote), "change_count": len(changes)}
+				after := map[string]any{"freeze_status": constants.FreezeStatusInvalidated, "blocked_reason": constants.FreezeBlockReasonInputsChanged, "changed_objects": changes}
+				if err := service.audit.RecordTx(tx, actor, requestID, "conflict.accept_blocked", "conflict_resolution", auditID(id), parameters, resolutionSummary(resolution), after); err != nil {
+					return err
+				}
+				blocked = frozenInputBlockError(changes)
+				return nil
+			}
 			values["selected_action"] = mustJSON(selected)
+			values["freeze_status"] = constants.FreezeStatusFrozen
+			values["frozen_changes_json"] = "[]"
+			values["freeze_blocked_reason"] = ""
 		}
 		updated, err := service.repository.Transition(tx, id, request.ExpectedVersion, constants.ResolutionStatusPendingReview, request.Decision, values)
 		if err != nil {
@@ -217,6 +237,9 @@ func (service *ConflictResolutionService) Review(id uint, request dto.ConflictAc
 	})
 	if err != nil {
 		return dto.ConflictResolutionResponse{}, err
+	}
+	if blocked != nil {
+		return dto.ConflictResolutionResponse{}, blocked
 	}
 	return service.Get(id)
 }
@@ -232,41 +255,165 @@ func (service *ConflictResolutionService) Export(id uint) (map[string]any, error
 	return map[string]any{
 		"record_type": "offline_contact_planning_decision", "resolution_id": resolution.ID, "conflict_key": resolution.ConflictKey,
 		"window_ids": resolution.WindowIDs, "selected_action": resolution.SelectedAction, "resolved_by": resolution.ResolvedBy,
-		"resolved_at": resolution.ResolvedAt, "disclaimer": "Planning record only; no antenna or spacecraft control command is emitted.",
+		"resolved_at": resolution.ResolvedAt, "freeze_status": resolution.FreezeStatus, "frozen_inputs_validated": resolution.FreezeStatus == constants.FreezeStatusFrozen,
+		"disclaimer": "Planning record only; no antenna or spacecraft control command is emitted.",
 	}, nil
 }
 
-func (service *ConflictResolutionService) verifyWindowVersions(tx *gorm.DB, encoded string) error {
+func freezeSnapshot(windows []model.ContactWindow, stations map[uint]model.GroundStation, assets map[uint]model.SatelliteAsset) dto.FrozenInputsSnapshot {
+	snapshot := dto.FrozenInputsSnapshot{FrozenAt: time.Now().UTC(), Windows: make([]dto.FrozenWindowInput, 0, len(windows)), Stations: []dto.FrozenStationInput{}, Satellites: []dto.FrozenSatelliteInput{}}
+	stationSeen := map[uint]bool{}
+	satelliteSeen := map[uint]bool{}
+	for _, window := range windows {
+		snapshot.Windows = append(snapshot.Windows, dto.FrozenWindowInput{ID: window.ID, Version: window.Version, WindowStatus: window.WindowStatus, Band: window.Band, Priority: window.Priority})
+		if !stationSeen[window.StationID] {
+			stationSeen[window.StationID] = true
+			if station, ok := stations[window.StationID]; ok {
+				snapshot.Stations = append(snapshot.Stations, dto.FrozenStationInput{ID: station.ID, Version: station.Version, StationCode: station.StationCode, AntennaCount: station.AntennaCount, SupportedBands: decodeStrings(station.SupportedBandsJSON), StationStatus: station.StationStatus})
+			}
+		}
+		if !satelliteSeen[window.SatelliteID] {
+			satelliteSeen[window.SatelliteID] = true
+			if asset, ok := assets[window.SatelliteID]; ok {
+				snapshot.Satellites = append(snapshot.Satellites, dto.FrozenSatelliteInput{ID: asset.ID, Version: asset.Version, SatelliteCode: asset.SatelliteCode, SupportedBands: decodeStrings(asset.SupportedBandsJSON), PriorityWeight: asset.PriorityWeight, MinimumContactSec: asset.MinimumContactSec, AssetStatus: asset.AssetStatus})
+			}
+		}
+	}
+	sort.Slice(snapshot.Stations, func(i, j int) bool { return snapshot.Stations[i].ID < snapshot.Stations[j].ID })
+	sort.Slice(snapshot.Satellites, func(i, j int) bool { return snapshot.Satellites[i].ID < snapshot.Satellites[j].ID })
+	return snapshot
+}
+
+func (service *ConflictResolutionService) evaluateFrozenInputs(tx *gorm.DB, resolution model.ConflictResolution) ([]dto.FrozenInputChange, error) {
+	if strings.TrimSpace(resolution.FrozenInputsJSON) == "" {
+		return service.evaluateLegacyWindowVersions(tx, resolution.WindowVersionsJSON)
+	}
+	snapshot := dto.FrozenInputsSnapshot{}
+	if err := json.Unmarshal([]byte(resolution.FrozenInputsJSON), &snapshot); err != nil {
+		return nil, Internal("stored frozen planning inputs are invalid", err)
+	}
+	changes := make([]dto.FrozenInputChange, 0)
+	for _, frozen := range snapshot.Windows {
+		window, err := service.windows.FindForUpdate(tx, frozen.ID)
+		if err != nil {
+			return nil, MapRepositoryError("contact window", err)
+		}
+		label := fmt.Sprintf("#%d", window.ID)
+		if window.Version != frozen.Version {
+			changes = append(changes, dto.FrozenInputChange{ObjectType: constants.FrozenObjectContactWindow, ObjectID: window.ID, Label: label, Field: "version", Before: frozen.Version, After: window.Version})
+		}
+		if window.WindowStatus != frozen.WindowStatus {
+			changes = append(changes, dto.FrozenInputChange{ObjectType: constants.FrozenObjectContactWindow, ObjectID: window.ID, Label: label, Field: "window_status", Before: frozen.WindowStatus, After: window.WindowStatus})
+		}
+		if window.Band != frozen.Band {
+			changes = append(changes, dto.FrozenInputChange{ObjectType: constants.FrozenObjectContactWindow, ObjectID: window.ID, Label: label, Field: "band", Before: frozen.Band, After: window.Band})
+		}
+		if window.Priority != frozen.Priority {
+			changes = append(changes, dto.FrozenInputChange{ObjectType: constants.FrozenObjectContactWindow, ObjectID: window.ID, Label: label, Field: "priority", Before: frozen.Priority, After: window.Priority})
+		}
+	}
+	for _, frozen := range snapshot.Stations {
+		station, err := service.stations.FindForUpdate(tx, frozen.ID)
+		if err != nil {
+			return nil, MapRepositoryError("ground station", err)
+		}
+		if station.AntennaCount != frozen.AntennaCount {
+			changes = append(changes, dto.FrozenInputChange{ObjectType: constants.FrozenObjectGroundStation, ObjectID: station.ID, Label: station.StationCode, Field: "antenna_count", Before: frozen.AntennaCount, After: station.AntennaCount})
+		}
+		if current := decodeStrings(station.SupportedBandsJSON); !equalStringSets(current, frozen.SupportedBands) {
+			changes = append(changes, dto.FrozenInputChange{ObjectType: constants.FrozenObjectGroundStation, ObjectID: station.ID, Label: station.StationCode, Field: "supported_bands", Before: frozen.SupportedBands, After: current})
+		}
+		if station.StationStatus != frozen.StationStatus {
+			changes = append(changes, dto.FrozenInputChange{ObjectType: constants.FrozenObjectGroundStation, ObjectID: station.ID, Label: station.StationCode, Field: "station_status", Before: frozen.StationStatus, After: station.StationStatus})
+		}
+	}
+	for _, frozen := range snapshot.Satellites {
+		asset, err := service.assets.FindForUpdate(tx, frozen.ID)
+		if err != nil {
+			return nil, MapRepositoryError("satellite asset", err)
+		}
+		if current := decodeStrings(asset.SupportedBandsJSON); !equalStringSets(current, frozen.SupportedBands) {
+			changes = append(changes, dto.FrozenInputChange{ObjectType: constants.FrozenObjectSatelliteAsset, ObjectID: asset.ID, Label: asset.SatelliteCode, Field: "supported_bands", Before: frozen.SupportedBands, After: current})
+		}
+		if asset.PriorityWeight != frozen.PriorityWeight {
+			changes = append(changes, dto.FrozenInputChange{ObjectType: constants.FrozenObjectSatelliteAsset, ObjectID: asset.ID, Label: asset.SatelliteCode, Field: "priority_weight", Before: frozen.PriorityWeight, After: asset.PriorityWeight})
+		}
+		if asset.MinimumContactSec != frozen.MinimumContactSec {
+			changes = append(changes, dto.FrozenInputChange{ObjectType: constants.FrozenObjectSatelliteAsset, ObjectID: asset.ID, Label: asset.SatelliteCode, Field: "minimum_contact_sec", Before: frozen.MinimumContactSec, After: asset.MinimumContactSec})
+		}
+		if asset.AssetStatus != frozen.AssetStatus {
+			changes = append(changes, dto.FrozenInputChange{ObjectType: constants.FrozenObjectSatelliteAsset, ObjectID: asset.ID, Label: asset.SatelliteCode, Field: "asset_status", Before: frozen.AssetStatus, After: asset.AssetStatus})
+		}
+	}
+	return changes, nil
+}
+
+func (service *ConflictResolutionService) evaluateLegacyWindowVersions(tx *gorm.DB, encoded string) ([]dto.FrozenInputChange, error) {
 	versions := map[string]uint{}
 	if err := json.Unmarshal([]byte(encoded), &versions); err != nil {
-		return Internal("stored window version snapshot is invalid", err)
+		return nil, Internal("stored window version snapshot is invalid", err)
 	}
 	keys := make([]string, 0, len(versions))
 	for id := range versions {
 		keys = append(keys, id)
 	}
 	sort.Strings(keys)
+	changes := make([]dto.FrozenInputChange, 0)
 	for _, encodedID := range keys {
 		parsed, err := strconv.ParseUint(encodedID, 10, 64)
 		if err != nil {
-			return Internal("stored window ID is invalid", err)
+			return nil, Internal("stored window ID is invalid", err)
 		}
 		window, err := service.windows.FindForUpdate(tx, uint(parsed))
 		if err != nil {
-			return MapRepositoryError("contact window", err)
+			return nil, MapRepositoryError("contact window", err)
 		}
 		if window.Version != versions[encodedID] {
-			return Conflict("version_conflict", fmt.Sprintf("window %d changed after conflict detection", window.ID), nil)
+			changes = append(changes, dto.FrozenInputChange{ObjectType: constants.FrozenObjectContactWindow, ObjectID: window.ID, Label: fmt.Sprintf("#%d", window.ID), Field: "version", Before: versions[encodedID], After: window.Version})
 		}
 	}
-	return nil
+	return changes, nil
+}
+
+func frozenInputBlockError(changes []dto.FrozenInputChange) *AppError {
+	code := "frozen_input_changed"
+	message := "frozen planning inputs changed after the conflict scan; acceptance is blocked and the conflict stays pending review"
+	for _, change := range changes {
+		if change.ObjectType == constants.FrozenObjectContactWindow && change.Field == "version" {
+			code = "version_conflict"
+			message = "frozen planning inputs changed after the conflict scan; window versions no longer match and acceptance is blocked"
+			break
+		}
+	}
+	return Conflict(code, message, nil).WithDetails(map[string]any{"blocked_reason": constants.FreezeBlockReasonInputsChanged, "changed_objects": changes})
+}
+
+func equalStringSets(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	counts := map[string]int{}
+	for _, value := range left {
+		counts[value]++
+	}
+	for _, value := range right {
+		counts[value]--
+		if counts[value] < 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func resolutionResponse(resolution model.ConflictResolution) (dto.ConflictResolutionResponse, error) {
 	response := dto.ConflictResolutionResponse{
 		ID: resolution.ID, ConflictKey: resolution.ConflictKey, ConflictType: resolution.ConflictType, ResolutionStatus: resolution.ResolutionStatus,
-		ResolvedBy: resolution.ResolvedBy, ReviewNote: resolution.ReviewNote, Version: resolution.Version, ResolvedAt: resolution.ResolvedAt,
-		CreatedAt: resolution.CreatedAt, UpdatedAt: resolution.UpdatedAt,
+		ResolvedBy: resolution.ResolvedBy, ReviewNote: resolution.ReviewNote, FreezeStatus: resolution.FreezeStatus,
+		FreezeBlockedReason: resolution.FreezeBlockedReason, FrozenChanges: []dto.FrozenInputChange{},
+		Version: resolution.Version, ResolvedAt: resolution.ResolvedAt, CreatedAt: resolution.CreatedAt, UpdatedAt: resolution.UpdatedAt,
+	}
+	if response.FreezeStatus == "" {
+		response.FreezeStatus = constants.FreezeStatusFrozen
 	}
 	if err := json.Unmarshal([]byte(resolution.WindowIDsJSON), &response.WindowIDs); err != nil {
 		return response, Internal("stored window IDs are invalid", err)
@@ -276,6 +423,18 @@ func resolutionResponse(resolution model.ConflictResolution) (dto.ConflictResolu
 	}
 	if err := json.Unmarshal([]byte(resolution.SuggestionsJSON), &response.Suggestions); err != nil {
 		return response, Internal("stored suggestions are invalid", err)
+	}
+	if strings.TrimSpace(resolution.FrozenInputsJSON) != "" {
+		snapshot := dto.FrozenInputsSnapshot{}
+		if err := json.Unmarshal([]byte(resolution.FrozenInputsJSON), &snapshot); err != nil {
+			return response, Internal("stored frozen planning inputs are invalid", err)
+		}
+		response.FrozenInputs = &snapshot
+	}
+	if strings.TrimSpace(resolution.FrozenChangesJSON) != "" {
+		if err := json.Unmarshal([]byte(resolution.FrozenChangesJSON), &response.FrozenChanges); err != nil {
+			return response, Internal("stored frozen input changes are invalid", err)
+		}
 	}
 	if resolution.SelectedAction != "" && resolution.SelectedAction != "{}" {
 		selected := dto.ResolutionSuggestion{}

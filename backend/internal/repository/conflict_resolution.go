@@ -80,3 +80,16 @@ func (repository *ConflictResolutionRepository) Transition(db *gorm.DB, id, expe
 	}
 	return result.RowsAffected == 1, nil
 }
+
+func (repository *ConflictResolutionRepository) RecordFreezeEvaluation(db *gorm.DB, id uint, status, reason, changesJSON string) error {
+	result := db.Model(&model.ConflictResolution{}).Where("id = ?", id).Updates(map[string]any{
+		"freeze_status": status, "freeze_blocked_reason": reason, "frozen_changes_json": changesJSON,
+	})
+	if result.Error != nil {
+		return fmt.Errorf("record freeze evaluation: %w", result.Error)
+	}
+	if result.RowsAffected != 1 {
+		return fmt.Errorf("record freeze evaluation: conflict resolution %d was not found", id)
+	}
+	return nil
+}

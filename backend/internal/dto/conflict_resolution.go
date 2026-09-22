@@ -44,21 +44,68 @@ type ConflictEvidence struct {
 	Metadata        map[string]interface{} `json:"metadata"`
 }
 
+type FrozenWindowInput struct {
+	ID           uint   `json:"id"`
+	Version      uint   `json:"version"`
+	WindowStatus string `json:"window_status"`
+	Band         string `json:"band"`
+	Priority     int    `json:"priority"`
+}
+
+type FrozenStationInput struct {
+	ID             uint     `json:"id"`
+	Version        uint     `json:"version"`
+	StationCode    string   `json:"station_code"`
+	AntennaCount   int      `json:"antenna_count"`
+	SupportedBands []string `json:"supported_bands"`
+	StationStatus  string   `json:"station_status"`
+}
+
+type FrozenSatelliteInput struct {
+	ID                uint     `json:"id"`
+	Version           uint     `json:"version"`
+	SatelliteCode     string   `json:"satellite_code"`
+	SupportedBands    []string `json:"supported_bands"`
+	PriorityWeight    float64  `json:"priority_weight"`
+	MinimumContactSec int      `json:"minimum_contact_sec"`
+	AssetStatus       string   `json:"asset_status"`
+}
+
+type FrozenInputsSnapshot struct {
+	FrozenAt   time.Time              `json:"frozen_at"`
+	Windows    []FrozenWindowInput    `json:"windows"`
+	Stations   []FrozenStationInput   `json:"stations"`
+	Satellites []FrozenSatelliteInput `json:"satellites"`
+}
+
+type FrozenInputChange struct {
+	ObjectType string `json:"object_type"`
+	ObjectID   uint   `json:"object_id"`
+	Label      string `json:"label"`
+	Field      string `json:"field"`
+	Before     any    `json:"before"`
+	After      any    `json:"after"`
+}
+
 type ConflictResolutionResponse struct {
-	ID               uint                   `json:"id"`
-	ConflictKey      string                 `json:"conflict_key"`
-	WindowIDs        []uint                 `json:"window_ids"`
-	ConflictType     string                 `json:"conflict_type"`
-	Evidence         ConflictEvidence       `json:"evidence"`
-	Suggestions      []ResolutionSuggestion `json:"suggestions"`
-	SelectedAction   *ResolutionSuggestion  `json:"selected_action,omitempty"`
-	ResolutionStatus string                 `json:"resolution_status"`
-	ResolvedBy       string                 `json:"resolved_by"`
-	ReviewNote       string                 `json:"review_note"`
-	Version          uint                   `json:"version"`
-	ResolvedAt       *time.Time             `json:"resolved_at,omitempty"`
-	CreatedAt        time.Time              `json:"created_at"`
-	UpdatedAt        time.Time              `json:"updated_at"`
+	ID                  uint                   `json:"id"`
+	ConflictKey         string                 `json:"conflict_key"`
+	WindowIDs           []uint                 `json:"window_ids"`
+	ConflictType        string                 `json:"conflict_type"`
+	Evidence            ConflictEvidence       `json:"evidence"`
+	Suggestions         []ResolutionSuggestion `json:"suggestions"`
+	SelectedAction      *ResolutionSuggestion  `json:"selected_action,omitempty"`
+	ResolutionStatus    string                 `json:"resolution_status"`
+	ResolvedBy          string                 `json:"resolved_by"`
+	ReviewNote          string                 `json:"review_note"`
+	FreezeStatus        string                 `json:"freeze_status"`
+	FreezeBlockedReason string                 `json:"freeze_blocked_reason,omitempty"`
+	FrozenInputs        *FrozenInputsSnapshot  `json:"frozen_inputs,omitempty"`
+	FrozenChanges       []FrozenInputChange    `json:"frozen_changes"`
+	Version             uint                   `json:"version"`
+	ResolvedAt          *time.Time             `json:"resolved_at,omitempty"`
+	CreatedAt           time.Time              `json:"created_at"`
+	UpdatedAt           time.Time              `json:"updated_at"`
 }
 
 type DetectionResult struct {
